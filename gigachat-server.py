@@ -23,6 +23,9 @@ CHAT_URLS = [
     "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
 ]
 USER_AGENT = "TulaTransportAssistant/1.0"
+RUNTIME_AUTHORIZATION_KEY = None
+RUNTIME_2GIS_KEY = None
+TLS_CONTEXT = None
 
 KNOWLEDGE = [
     ["Льготный проезд", "Льготный проезд действует для установленных федеральных и региональных льготных категорий. Право подтверждается статусом льготника.", "Постановление администрации Тульской области № 83", "https://tularegion.ru/upload/iblock/cb3/yv6hnn3uigkzly2fr5z6wlpucbgs6iqc.docx", "льгот льгота пенсионер ветеран инвалид кому положен"],
@@ -48,11 +51,146 @@ KNOWLEDGE = [
 def tokens(text):
     return set(re.findall(r"[а-яa-z0-9]{3,}", text.lower().replace("ё", "е")))
 
+def tls_context():
+    """Keep TLS verification on while combining Windows and optional PEM roots."""
+    global TLS_CONTEXT
+    if TLS_CONTEXT:
+        return TLS_CONTEXT
+    context = ssl.create_default_context()
+    for bundle in (
+        os.environ.get("GIGACHAT_CA_BUNDLE"),
+        os.environ.get("GIGACHAT_SUB_CA_BUNDLE"),
+        ROOT / "russian_trusted_root_ca_pem.crt",
+        ROOT / "russian_trusted_sub_ca_pem.crt",
+        os.environ.get("GIGACHAT_EXTRA_CA_BUNDLE"),
+    ):
+        if bundle and Path(bundle).is_file():
+            context.load_verify_locations(cafile=bundle)
+    if os.name == "nt":
+        # Corporate TLS inspection roots normally live in Windows certificate stores.
+        for store in ("ROOT", "CA"):
+            try:
+                for certificate, encoding, _trust in ssl.enum_certificates(store):
+                    if encoding == "x509_asn":
+                        try:
+                            context.load_verify_locations(cadata=certificate)
+                        except ssl.SSLError:
+                            pass
+            except OSError:
+                pass
+    TLS_CONTEXT = context
+    return context
+
 def https_open(request, timeout):
-    """Keep TLS verification on; an optional PEM bundle supports НУЦ/corporate CAs."""
-    bundle = os.environ.get("GIGACHAT_CA_BUNDLE")
-    context = ssl.create_default_context(cafile=bundle) if bundle else ssl.create_default_context()
-    return urlopen(request, timeout=timeout, context=context)
+    return urlopen(request, timeout=timeout, context=tls_context())
+
+def tula_query(query):
+    """Bias free-form searches toward Tula without breaking named regional places."""
+    return query if re.search(r"тул|щёк|узлов|новомоск|донск|вен[её]в|ясногор|ефрем", query, re.I) else query + " Тула"
+
+def two_gis_route(source, target):
+    """Build a public-transport itinerary via the 2GIS Routing API."""
+    key = RUNTIME_2GIS_KEY or os.environ.get("TWOGIS_API_KEY")
+    if not key:
+        raise RuntimeError("Ключ 2ГИС не задан")
+    payload = {
+        "source": {"point": {"lat": source["lat"], "lon": source["lon"]}},
+        "target": {"point": {"lat": target["lat"], "lon": target["lon"]}},
+        "transport": ["pedestrian", "bus", "tram", "trolleybus", "shuttle_bus", "suburban_train"],
+        "locale": "ru",
+        "enable_schedule": True,
+        "max_result_count": 10,
+        "direct_routes_count": 5,
+    }
+    url = "https://routing.api.2gis.com/public_transport/2.0?" + urlencode({"key": key})
+    request = Request(url, data=json.dumps(payload).encode("utf-8"), method="POST")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("Accept", "application/json")
+    with https_open(request, timeout=45) as response:
+        return json.load(response)
+
+def _route_names(movement):
+    """Extract the public route numbers exposed by a 2GIS transport movement."""
+    names = []
+    for item in movement.get("routes", []):
+        names.extend(item.get("names", []) or [])
+        for field in ("name", "number", "ref"):
+            value = item.get(field)
+            if value:
+                names.append(str(value))
+    return {re.sub(r"[^0-9a-zа-яё]", "", str(name).lower()) for name in names}
+
+def two_gis_line(source, target, transport, number):
+    """Ask 2GIS for the actual public-transport geometry of one selected line.
+
+    The previous client-only implementation joined stops with straight segments.
+    Here the geometry and platform locations come directly from Routing API.
+    """
+    type_map = {
+        "bus": "bus", "tram": "tram", "trolley": "trolleybus",
+        "minibus": "shuttle_bus", "train": "suburban_train",
+    }
+    if transport not in type_map:
+        raise ValueError("Неизвестный вид транспорта")
+    key = RUNTIME_2GIS_KEY or os.environ.get("TWOGIS_API_KEY")
+    if not key:
+        raise RuntimeError("Ключ 2ГИС не задан")
+    payload = {
+        "source": {"point": {"lat": source[0], "lon": source[1]}},
+        "target": {"point": {"lat": target[0], "lon": target[1]}},
+        "transport": ["pedestrian", type_map[transport]],
+        "locale": "ru",
+        "enable_schedule": True,
+        "max_result_count": 12,
+        "direct_routes_count": 12,
+    }
+    url = "https://routing.api.2gis.com/public_transport/2.0?" + urlencode({"key": key})
+    request = Request(url, data=json.dumps(payload).encode("utf-8"), method="POST")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("Accept", "application/json")
+    with https_open(request, timeout=45) as response:
+        candidates = json.load(response)
+    wanted = re.sub(r"[^0-9a-zа-яё]", "", str(number).lower())
+    for candidate in candidates:
+        if any(wanted in _route_names(movement) for movement in candidate.get("movements", [])):
+            return candidate
+    raise RuntimeError(f"2ГИС не подтвердил трассу маршрута №{number} для выбранного направления")
+
+def two_gis_geocode(query):
+    """Resolve a passenger-entered stop, address, or landmark to 2GIS coordinates."""
+    key = RUNTIME_2GIS_KEY or os.environ.get("TWOGIS_API_KEY")
+    if not key:
+        raise RuntimeError("Ключ 2ГИС не задан")
+    params = urlencode({
+        "q": tula_query(query),
+        "type": "station,building,street,attraction,adm_div.place",
+        "sort_point": "37.618,54.193",
+        "fields": "items.point,items.address,items.full_name,items.name_ex",
+        "key": key,
+        "locale": "ru_RU",
+    })
+    request = Request("https://catalog.api.2gis.com/3.0/items?" + params)
+    request.add_header("Accept", "application/json")
+    with https_open(request, timeout=20) as response:
+        return json.load(response)
+
+def two_gis_stop_board(query):
+    """Return a matching 2GIS stop and the transport lines known for it."""
+    key = RUNTIME_2GIS_KEY or os.environ.get("TWOGIS_API_KEY")
+    if not key:
+        raise RuntimeError("Ключ 2ГИС не задан")
+    params = urlencode({
+        "q": tula_query(query),
+        "type": "station",
+        "sort_point": "37.618,54.193",
+        "fields": "items.point,items.routes,items.directions,items.address,items.full_name",
+        "key": key,
+        "locale": "ru_RU",
+    })
+    request = Request("https://catalog.api.2gis.com/3.0/items?" + params)
+    request.add_header("Accept", "application/json")
+    with https_open(request, timeout=20) as response:
+        return json.load(response)
 
 def retrieve(question):
     words = tokens(question)
@@ -75,7 +213,7 @@ class Giga:
         if supplied_token:
             cls.token, cls.expires = supplied_token, time.time() + 25 * 60
             return cls.token
-        key = os.environ.get("GIGACHAT_AUTHORIZATION_KEY")
+        key = RUNTIME_AUTHORIZATION_KEY or os.environ.get("GIGACHAT_AUTHORIZATION_KEY")
         if not key:
             raise RuntimeError("Ключ GigaChat не задан")
         preferred = os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
@@ -140,6 +278,100 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(204); self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS"); self.send_header("Access-Control-Allow-Headers", "Content-Type"); self.end_headers()
 
     def do_POST(self):
+        global RUNTIME_AUTHORIZATION_KEY, RUNTIME_2GIS_KEY
+        if self.path == "/api/config/gigachat":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                key = json.loads(self.rfile.read(length)).get("authorizationKey", "").strip()
+                if len(key) < 20:
+                    raise ValueError("Некорректный ключ")
+                RUNTIME_AUTHORIZATION_KEY = key
+                Giga.token, Giga.expires = None, 0
+                self.send_response(204); self.end_headers()
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_response(400); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": str(error)}, ensure_ascii=False).encode())
+            return
+        if self.path == "/api/config/2gis":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                key = json.loads(self.rfile.read(length)).get("apiKey", "").strip()
+                if len(key) < 20:
+                    raise ValueError("Некорректный ключ 2ГИС")
+                RUNTIME_2GIS_KEY = key
+                self.send_response(204); self.end_headers()
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_response(400); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": str(error)}, ensure_ascii=False).encode())
+            return
+        if self.path == "/api/transport/2gis/line":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length))
+                route_type, number = payload.get("type"), str(payload.get("number", "")).strip()
+                source, target = payload.get("source"), payload.get("target")
+                if not number or not isinstance(source, list) or not isinstance(target, list) or len(source) != 2 or len(target) != 2:
+                    raise ValueError("Не хватает данных выбранного маршрута")
+                if not all(isinstance(value, (int, float)) for value in source + target):
+                    raise ValueError("Некорректные координаты остановок")
+                result = two_gis_line(source, target, route_type, number)
+                self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps(result, ensure_ascii=False).encode())
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_response(400); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": str(error)}, ensure_ascii=False).encode())
+            except HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")[:500]
+                self.send_response(502); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": f"2ГИС HTTP {error.code}: {detail}"}, ensure_ascii=False).encode())
+            except (URLError, RuntimeError) as error:
+                self.send_response(502); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": str(error)}, ensure_ascii=False).encode())
+            return
+        if self.path == "/api/transport/2gis/route":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length))
+                source, target = payload.get("source"), payload.get("target")
+                for point in (source, target):
+                    if not isinstance(point, dict) or not isinstance(point.get("lat"), (int, float)) or not isinstance(point.get("lon"), (int, float)):
+                        raise ValueError("Нужны координаты точек A и B")
+                result = two_gis_route(source, target)
+                self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps(result, ensure_ascii=False).encode())
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_response(400); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": str(error)}, ensure_ascii=False).encode())
+            except HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")[:500]
+                self.send_response(502); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": f"2ГИС HTTP {error.code}: {detail}"}, ensure_ascii=False).encode())
+            except (URLError, RuntimeError) as error:
+                self.send_response(502); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": str(error)}, ensure_ascii=False).encode())
+            return
+        if self.path == "/api/transport/2gis/geocode":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                query = json.loads(self.rfile.read(length)).get("query", "").strip()
+                if not query or len(query) > 200:
+                    raise ValueError("Введите точку отправления или назначения")
+                result = two_gis_geocode(query)
+                self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps(result, ensure_ascii=False).encode())
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_response(400); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": str(error)}, ensure_ascii=False).encode())
+            except HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")[:500]
+                self.send_response(502); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": f"2ГИС HTTP {error.code}: {detail}"}, ensure_ascii=False).encode())
+            except (URLError, RuntimeError) as error:
+                self.send_response(502); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": str(error)}, ensure_ascii=False).encode())
+            return
+        if self.path == "/api/transport/2gis/stop-board":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                query = json.loads(self.rfile.read(length)).get("query", "").strip()
+                if not query or len(query) > 200:
+                    raise ValueError("Введите название остановки")
+                result = two_gis_stop_board(query)
+                self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps(result, ensure_ascii=False).encode())
+            except (ValueError, json.JSONDecodeError) as error:
+                self.send_response(400); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": str(error)}, ensure_ascii=False).encode())
+            except HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")[:500]
+                self.send_response(502); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": f"2ГИС HTTP {error.code}: {detail}"}, ensure_ascii=False).encode())
+            except (URLError, RuntimeError) as error:
+                self.send_response(502); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": str(error)}, ensure_ascii=False).encode())
+            return
         if self.path != "/api/chat":
             self.send_error(404); return
         try:
@@ -157,6 +389,21 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_response(502); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": f"Не удалось установить защищённое соединение с GigaChat: {error.reason}"}, ensure_ascii=False).encode())
         except RuntimeError as error:
             self.send_response(502); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": str(error)}, ensure_ascii=False).encode())
+
+    def do_GET(self):
+        if self.path == "/api/status":
+            ready = bool(RUNTIME_AUTHORIZATION_KEY or os.environ.get("GIGACHAT_AUTHORIZATION_KEY") or os.environ.get("GIGACHAT_ACCESS_TOKEN"))
+            two_gis_ready = bool(RUNTIME_2GIS_KEY or os.environ.get("TWOGIS_API_KEY"))
+            self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"gigachatConfigured": ready, "twoGisConfigured": two_gis_ready}, ensure_ascii=False).encode())
+            return
+        if self.path == "/api/map-config":
+            key = RUNTIME_2GIS_KEY or os.environ.get("TWOGIS_API_KEY")
+            if not key:
+                self.send_response(503); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"error": "Ключ 2ГИС не задан"}, ensure_ascii=False).encode())
+                return
+            self.send_response(200); self.send_header("Content-Type", "application/json; charset=utf-8"); self.end_headers(); self.wfile.write(json.dumps({"apiKey": key}, ensure_ascii=False).encode())
+            return
+        super().do_GET()
 
 if __name__ == "__main__":
     print("Прототип доступен на http://127.0.0.1:8771")

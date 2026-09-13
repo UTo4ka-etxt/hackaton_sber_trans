@@ -1,0 +1,11 @@
+# Runtime secrets and local Python cache
+.env
+.env.*
+*.py[cod]
+__pycache__/
+
+# Local editor and system files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
